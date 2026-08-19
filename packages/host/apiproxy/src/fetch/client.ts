@@ -296,8 +296,21 @@ export abstract class AbstractApiClient implements IApiClient {
   }
 
   protected mintRpcId(): RpcId {
-    // crypto.randomUUID is a Web API (browser + Node ≥19): keeps this base platform-neutral.
-    return RpcId(crypto.randomUUID())
+    // crypto.randomUUID is a Web API (browser + Node ≥19), but browsers only
+    // expose it in secure contexts; plain-http LAN access (e.g. behind the
+    // auth proxy) lacks it, so fall back to crypto.getRandomValues, which
+    // browsers expose everywhere. These ids are opaque correlation tokens.
+    const cryptoApi = globalThis.crypto
+    if (typeof cryptoApi?.randomUUID === 'function') return RpcId(cryptoApi.randomUUID())
+    const bytes = cryptoApi?.getRandomValues?.(new Uint8Array(16))
+    if (bytes) {
+      bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40
+      bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80
+      const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+      return RpcId(`${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`)
+    }
+    // Last resort (non-crypto RNG): ids stay opaque correlation tokens.
+    return RpcId(`rpc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`)
   }
 
   /**

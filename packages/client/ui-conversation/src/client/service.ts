@@ -63,7 +63,10 @@ export interface IConversation {
 function browserDraftAttachment(file: File): ComposerAttachment {
   return {
     kind: 'image',
-    id: crypto.randomUUID() as DraftAttachmentId,
+    // crypto.randomUUID is unavailable in insecure contexts (plain-http LAN);
+    // fall back to a local id so attaching images keeps working there.
+    id: (globalThis.crypto?.randomUUID?.()
+      ?? `draft-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`) as DraftAttachmentId,
     previewUrl: URL.createObjectURL(file),
     file,
   }
