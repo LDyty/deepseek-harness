@@ -180,8 +180,22 @@ export function createMessage<T extends NewMessage>(
 ): T & Pick<Message, 'id'> {
   return freezeMessage({
     ...input,
-    id: MessageId(crypto.randomUUID()),
+    id: mintMessageId(),
   })
+}
+
+/** Browser-safe message id: crypto.randomUUID needs a secure context; plain-http LAN access lacks it. */
+function mintMessageId(): MessageId {
+  const cryptoApi = globalThis.crypto
+  if (typeof cryptoApi?.randomUUID === 'function') return MessageId(cryptoApi.randomUUID())
+  const bytes = cryptoApi?.getRandomValues?.(new Uint8Array(16))
+  if (bytes) {
+    bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40
+    bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+    return MessageId(`${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`)
+  }
+  return MessageId(`msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`)
 }
 
 /**
