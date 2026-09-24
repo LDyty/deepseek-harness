@@ -3,7 +3,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentOptions, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-session-persistence'
+import type { SessionLogWindow, SessionWindowOptions } from '@deepseek-ai/dsh-session-persistence'
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { TypertLookupFailure } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-typert-registry'
 
@@ -40,6 +41,16 @@ export interface ApiRemoteAgentOptions {
 
 /** Cold identity absent from the durable session store. */
 export class ApiRemoteSessionNotFound extends Error {}
+
+/**
+ * The windowed-read capability, as an OPTIONAL member: a persistence provider
+ * may expose only the full-read surface (partial compositions and test
+ * providers do), and asking for the capability is how this Host keeps its
+ * full-read path for them instead of failing on a missing method.
+ */
+interface WindowedPersistence {
+  readWindow?: SessionPersistence['readWindow']
+}
 
 /** Session identity whose lifecycle belongs to subagent routing. */
 export class ApiRemoteSubagentSessionOwnership extends Error {
@@ -108,6 +119,46 @@ export async function inspectApiRemoteSession(
     throw new ApiRemoteSessionNotFound(`session "${sessionId}" not found`)
   }
   return { meta: inspected.meta, events: [...inspected.events] }
+}
+
+/**
+ * Read one page-sized window of a cold served session without materializing
+ * its log.
+ *
+ * The servability check is the same one {@link inspectApiRemoteSession} makes —
+ * a project-backed identity with a durable header — so a windowed read cannot
+ * serve a session the full read would refuse. The difference is only cost: the
+ * backend may answer from the tail of its artifact, which is what keeps a page
+ * of a very long conversation affordable.
+ * @param ctx - Host Context carrying the optional persistence provider.
+ * @param sessionId - durable identity to read a window of.
+ * @param options - the page: its exclusive upper bound and message quota.
+ * @returns the backend's window, or `undefined` when the backend has no
+ *   windowed read and the caller must use {@link inspectApiRemoteSession}.
+ * @throws {@link ApiRemoteSessionNotFound} when the identity has no
+ *   project-backed session.
+ */
+export async function inspectApiRemoteSessionWindow(
+  ctx: Context,
+  sessionId: SessionId,
+  options: SessionWindowOptions,
+): Promise<SessionLogWindow | undefined> {
+  const persistence = ctx.get('sessionPersistence')
+  if (persistence === undefined) {
+    throw new Error('session persistence is not configured (load a dsh-session-persistence backend)')
+  }
+  const meta = (await persistence.list()).find(candidate => candidate.id === sessionId)
+  if (meta === undefined || meta.cwd === undefined) {
+    throw new ApiRemoteSessionNotFound(`session "${sessionId}" not found`)
+  }
+  const readWindow = (persistence as WindowedPersistence).readWindow
+  if (readWindow === undefined) return undefined
+  const window = await readWindow.call(persistence, sessionId, options)
+  if (window === undefined) return undefined
+  if (window.meta.cwd === undefined) {
+    throw new ApiRemoteSessionNotFound(`session "${sessionId}" not found`)
+  }
+  return window
 }
 
 /**

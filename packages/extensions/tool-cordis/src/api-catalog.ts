@@ -1228,6 +1228,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the validated header and current logical event log.',
       },
       {
+        signature: 'readWindow(_id: SessionId, _options: SessionWindowOptions, signal?: AbortSignal): Promise<SessionLogWindow | undefined>',
+        description: 'Read ONE bounded window of a stored log — the transcript page a cold read actually serves — instead of the whole event graph the default full read materializes. The window starts at the page cut for `maxMessages` append-origin messages counted backwards from `beforeSeq` (exclusive) or from the stored tail, and carries SessionLogWindow.hasMore so the caller can page further back on demand.\n\nThe default returns `undefined`: a backend that can only read its whole artifact leaves the caller on its full-read path, which is why adding this capability is not a contract change for existing backends. A backend that overrides it owns the same refusals a full read raises for the same bytes (unreadable container, unparsable row, seq gap) and MUST NOT return a window whose events are not contiguous.',
+        parameters: [{ name: '_id', description: 'the persisted session to read a window of.' }, { name: '_options', description: 'the page: its exclusive upper bound and message quota.' }, { name: 'signal', description: 'optional cancellation for backend read work.' }],
+        returns: 'the window, or `undefined` when this backend has no windowed read and the caller must fall back to {@link inspect}.',
+      },
+      {
         signature: 'abstract readFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ meta: SessionHeader; events: SessionEvent[] }>',
         description: 'Read the stored events from `fromSeq` onward — the read-from-seq primitive for read models that resume from a watermark (e.g. a persisted projection cache folding only the tail past its checkpoint). Unlike inspect, it is a detached physical suffix read: no preparation cache, torn-tail truncation, synthetic closers, or coordinator-state publication. Only events from the valid contiguous stored prefix are returned, so a torn fragment never reaches the caller. `fromSeq` at or beyond the stored prefix returns an empty event list (never an error). Backends whose medium can seek by seq (SQLite) read only the suffix; sequential media (JSONL, both encodings) still parse the whole artifact and skip forward — the primitive bounds what is RETURNED and refolded, not every backend\'s physical read.',
         parameters: [{ name: 'id', description: 'the persisted session to read.' }, { name: 'fromSeq', description: 'first event seq to include; a non-negative safe integer.' }, { name: 'signal', description: 'optional cancellation for queued and backend read work.' }],
@@ -4174,6 +4180,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface SessionLogSnapshot {\n    session: SessionHeader;\n    events: SessionEvent[];\n}',
   },
   {
+    name: 'SessionLogWindow',
+    declaration: 'export interface SessionLogWindow {\n    readonly meta: SessionHeader;\n    readonly events: readonly SessionEvent[];\n    readonly hasMore: boolean;\n}',
+  },
+  {
     name: 'SessionPersistenceRevision',
     declaration: 'export type SessionPersistenceRevision = Branded<\'SessionPersistenceRevision\'>;',
   },
@@ -4312,6 +4322,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionTitleUserMessage',
     declaration: 'export interface SessionTitleUserMessage {\n    readonly seq: number;\n    readonly text: string;\n}',
+  },
+  {
+    name: 'SessionWindowOptions',
+    declaration: 'export interface SessionWindowOptions {\n    beforeSeq?: number;\n    maxMessages: number;\n}',
   },
   {
     name: 'SettingsApplies',

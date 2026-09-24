@@ -19,7 +19,7 @@ import {
   SessionPersistence, SessionPersistenceRevision, PersistenceCoordinator, SessionFormatUnsupportedError,
   type PersistenceBackend, type SessionLocation, type SessionPersistenceSnapshot,
   type SessionInspection, type SessionPersistenceRevision as PersistenceRevision, type SessionRawArtifact,
-  type StoredPrefix,
+  type SessionLogWindow, type SessionWindowOptions, type StoredPrefix,
 } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionEvent, SessionId, SessionHeader, SessionPreparation } from '@deepseek-ai/dsh-session'
 import {
@@ -30,12 +30,28 @@ import {
 import {
   compressZstdFrame, createZstdFrameDecoder, decompressZstdFrame, decompressZstdPrefix, scanZstdFrames,
 } from './zstd.ts'
+import { readZstdSessionWindow } from './window.ts'
 import { ensureDurableDirectoryWin32, publishNewFileWin32 } from './win32.ts'
 
 export type { JsonlCompression } from './format.ts'
 
 const DEFAULT_PACK_CHUNKS = true
 const DEFAULT_COMPRESSION: JsonlCompression = 'zstd'
+/**
+ * Artifact size at or under which a cold transcript page keeps the full-read
+ * path.
+ *
+ * The windowed read exists for logs whose whole-graph expansion is the problem,
+ * and that expansion costs roughly twenty heap bytes per compressed byte
+ * (measured: 186 MiB of artifact → 3.5 GiB of events). At this cutoff that is
+ * about 160 MiB of events — survivable, and cheap enough that the ordinary
+ * read's exactness is worth more than the window's speed. So the cutoff is set
+ * where the full read stops being comfortable rather than where it stops being
+ * instant, which keeps every normal session on precisely the behavior it had
+ * before the windowed read existed. Lower it to window more sessions, or 0 to
+ * window all of them.
+ */
+export const DEFAULT_WINDOW_READ_MIN_BYTES = 8 * 1024 * 1024
 /**
  * Internal scheduling constant, not deployment configuration: balance
  * frame-boundary event-loop yields against `setImmediate` overhead. One frame
@@ -80,6 +96,13 @@ export interface Config {
   preparedSessionCacheSize?: number
   /** Fixed live-event coalescing window; not a backend completion deadline. */
   writeBatchMaxDelayMs?: number
+  /**
+   * Smallest artifact size, in bytes, that a cold transcript page reads as a
+   * window instead of a full log. Below it the full read stays in use, so
+   * ordinary sessions keep exactly the behavior and caching they had before
+   * the windowed read existed; set `0` to window every read of any size.
+   */
+  windowReadMinBytes?: number
 }
 
 /** Opaque coordinator token for replacing bytes recovered from a torn frame. */
@@ -130,6 +153,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     preparedSessionCacheSize: z.number().step(1).min(1).default(DEFAULT_PREPARED_SESSION_CACHE_SIZE),
     writeBatchMaxDelayMs: z.number().step(1).min(1).max(MAX_WRITE_BATCH_DELAY_MS)
       .default(DEFAULT_WRITE_BATCH_MAX_DELAY_MS),
+    windowReadMinBytes: z.number().step(1).min(0).default(DEFAULT_WINDOW_READ_MIN_BYTES),
   })
 
   /**
@@ -142,6 +166,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   private root: string
   private packChunks: boolean
   private compression: JsonlCompression
+  private windowReadMinBytes: number
   private coordinator: PersistenceCoordinator<JsonlTornMarker>
   private rootEncodingCheck: Promise<void> | undefined
 
@@ -156,6 +181,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
       ?? DEFAULT_WRITE_BATCH_MAX_DELAY_MS
     this.packChunks = config.packChunks ?? DEFAULT_PACK_CHUNKS
     this.compression = config.compression ?? DEFAULT_COMPRESSION
+    this.windowReadMinBytes = config.windowReadMinBytes ?? DEFAULT_WINDOW_READ_MIN_BYTES
     this.assertUsableRoot()
     this.coordinator = new PersistenceCoordinator<JsonlTornMarker>(this.ctx, this, {
       preparedSessionCacheSize,
@@ -191,6 +217,41 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
 
   inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspection> {
     return this.coordinator.inspect(id, signal)
+  }
+
+  /**
+   * Serve one cold transcript page from the tail of the frame container,
+   * expanding only the frames the page's cut needs.
+   *
+   * This deliberately bypasses {@link inspect}: a prepared source is the whole
+   * event graph, cached for a later resume, and that graph is exactly what a
+   * fifty-message page must not pay for. Nothing here is retained between
+   * calls and nothing enters the preparation cache, so reading pages of a huge
+   * session leaves no standing memory behind.
+   * @param id - the persisted session to read a window of.
+   * @param options - the page: its exclusive upper bound and message quota.
+   * @param signal - optional cancellation for the stat, read, and decode work.
+   * @returns the window, or `undefined` for an absent session, a non-Zstandard
+   *   artifact, or an artifact under {@link Config.windowReadMinBytes} — every
+   *   one of which leaves the caller on its full-read path.
+   */
+  override async readWindow(
+    id: SessionId,
+    options: SessionWindowOptions,
+    signal?: AbortSignal,
+  ): Promise<SessionLogWindow | undefined> {
+    if (signal?.aborted === true) signal.throwIfAborted()
+    await this.ensureRootEncoding()
+    signal?.throwIfAborted()
+    const path = await this.findLog(id, signal)
+    if (path === undefined) return undefined
+    if (this.compression !== 'zstd') return undefined
+    const { buffer } = await this.readStableFile(path, signal)
+    if (buffer.byteLength < this.windowReadMinBytes) return undefined
+    signal?.throwIfAborted()
+    const window = readZstdSessionWindow(buffer, { ...options, ...signal === undefined ? {} : { signal } })
+    signal?.throwIfAborted()
+    return window
   }
 
   // JSONL is sequential media: no loadStoredFrom hook, so the coordinator

@@ -17,7 +17,7 @@ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, freezeMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { errorChain } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageSource } from '@deepseek-ai/dsh-llm'
-import { isAppendSurfaceEvent, isJsonValue } from '@deepseek-ai/dsh-session'
+import { isJsonValue, pageCut } from '@deepseek-ai/dsh-session'
 import type { JsonValue, Session, SessionEvent, SessionEventMap, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { SessionQueryError, type SessionSearchCursor } from '@deepseek-ai/dsh-session-query'
@@ -108,6 +108,7 @@ import {
   createApiRemoteAgentResolver,
   hasApiRemoteSubagentOwner,
   inspectApiRemoteSession,
+  inspectApiRemoteSessionWindow,
 } from '@deepseek-ai/dsh-api-remotes'
 import { canOpenNativePath, openNativePath, openNativeTextFile } from './native-path-opener.ts'
 
@@ -231,26 +232,11 @@ function paginate(
   maxMessages: number,
 ): { events: SessionEvent[]; hasMore: boolean } {
   const window = beforeSeq === undefined ? [...events] : events.filter(event => event.seq < beforeSeq)
-  let count = 0
-  let cut = 0
-  for (let i = window.length - 1; i >= 0; i--) {
-    const event = window[i] as SessionEvent
-    if (!MESSAGE_TYPES.has(event.type) || !isAppendSurfaceEvent(event)) continue
-    count++
-    const sources = (event as { sourceEventSeqs?: number[] }).sourceEventSeqs
-    let groupStart = event.seq
-    if (sources !== undefined) {
-      for (const source of sources) {
-        if (source < groupStart) groupStart = source
-      }
-    }
-    if (count >= maxMessages) {
-      cut = groupStart
-      break
-    }
-  }
-  const page = window.filter(event => event.seq >= cut)
-  return { events: page, hasMore: cut > 0 }
+  // The cut rule is shared with the streamed window reader (see `pageCut`), so
+  // a page cut from a materialized log and one cut while decoding the same
+  // log's tail are the same page.
+  const { fromSeq, hasMore } = pageCut(window, undefined, maxMessages)
+  return { events: window.filter(event => event.seq >= fromSeq), hasMore }
 }
 
 /** Wrap an ok result echoing the request's rpcId. */
@@ -742,6 +728,26 @@ function backscanArgs(events: readonly SessionEvent[], callId: string): { name: 
   return undefined
 }
 
+/**
+ * Render one event window through the presenter path: every entry carries its
+ * event plus the view its presenter resolved, with tool-call blocks recovering
+ * their arguments from an in-page backscan.
+ * @param ctx - Context carrying the presenter registry.
+ * @param events - the page's events, oldest first.
+ * @param scope - the registry view scope presenters resolve in.
+ * @returns one history entry per event, in the same order.
+ */
+function pageEntries(
+  ctx: Context,
+  events: readonly SessionEvent[],
+  scope?: ScopeKey,
+): HistoryEntry[] {
+  return events.map((event) => {
+    const view = viewFor(ctx, event, callId => backscanArgs(events, callId), scope)
+    return { event, ...view === undefined ? {} : { view } }
+  })
+}
+
 /** Render one detached history page through the same presenter path as ordinary history. */
 function historyPage(
   ctx: Context,
@@ -751,13 +757,7 @@ function historyPage(
   scope?: ScopeKey,
 ): { events: HistoryEntry[]; hasMore: boolean } {
   const page = paginate(events, beforeSeq, maxMessages ?? DEFAULT_MAX_MESSAGES)
-  return {
-    events: page.events.map((event) => {
-      const view = viewFor(ctx, event, callId => backscanArgs(page.events, callId), scope)
-      return { event, ...view === undefined ? {} : { view } }
-    }),
-    hasMore: page.hasMore,
-  }
+  return { events: pageEntries(ctx, page.events, scope), hasMore: page.hasMore }
 }
 
 /**
@@ -773,11 +773,19 @@ function historyPage(
  * Which session a transcript read is served from. An attached session is the
  * live object and keeps appending, so its events and projection baseline are
  * read together in one synchronous step; a detached one is already a frozen
- * inspection.
+ * inspection. A windowed source is the one case where the events are NOT the
+ * session's log: a backend cut the requested page out of its own artifact, so
+ * the page is served as-is and its older-event flag is the backend's.
  */
 type HistorySource =
   | { readonly kind: 'attached'; readonly session: Session }
   | { readonly kind: 'detached'; readonly header: SessionHeader; readonly events: SessionEvent[] }
+  | {
+    readonly kind: 'window'
+    readonly header: SessionHeader
+    readonly events: SessionEvent[]
+    readonly hasMore: boolean
+  }
 
 function projectionsFor(ctx: Context, session: Session): SessionProjectionsBlock | undefined {
   const registry = ctx.get('sessionProjections')
@@ -815,6 +823,51 @@ function detachedProjectionsFor(
   const registry = ctx.get('sessionProjections')
   if (registry === undefined) return undefined
   return registry.restore({}, events, 0).snapshot
+}
+
+/**
+ * Projection baseline for a windowed history tail, without the log the window
+ * deliberately omitted.
+ *
+ * The durable cold cache is the right source FIRST, and it is the honest one:
+ * it holds the same identity-checked rows the session list serves, it is never
+ * wrong (only as stale as the last checkpoint), and it costs no log read at
+ * all. So the transcript's cold baseline agrees with the row the user just
+ * clicked instead of being fresher than it.
+ *
+ * Folding the cache forward is NOT the alternative: its rows sit at a
+ * checkpoint watermark, and the registry refuses to refold from `init` over a
+ * window whose first seq is past that watermark — closing that gap is the
+ * whole-log read this path exists to avoid. A session with no cache row at all
+ * therefore falls back to folding the window, which is best-effort by
+ * construction: keys the window fully determines are exact and fresh, keys it
+ * only partially observes describe the window rather than the conversation.
+ * Both remain a seed, not a claim — the next live push at a higher seq
+ * supersedes either one when the session is actually opened.
+ * @param ctx - Context carrying the projection registry and cold cache.
+ * @param meta - the session's header, the cache's identity witness.
+ * @param events - the window, for the fallback fold.
+ * @returns the baseline block, or undefined when no registry is composed.
+ */
+function windowProjectionsFor(
+  ctx: Context,
+  meta: SessionHeader,
+  events: readonly SessionEvent[],
+): SessionProjectionsBlock | undefined {
+  try {
+    const cached = ctx.get('sessionProjectionCache')?.cachedSnapshot(meta)
+    if (cached !== undefined && Object.keys(cached.values).length > 0) return cached
+  } catch (error: unknown) {
+    ctx.logger.warn(`session.history: cold projection cache for "${meta.id}" failed (folding the window instead): ${String(error)}`)
+  }
+  return detachedProjectionsFor(ctx, events)
+}
+
+/** Optional projections block: absent when a read has no baseline to carry. */
+function projectionsBlock(
+  projections: SessionProjectionsBlock | undefined,
+): { projections?: SessionProjectionsBlock } {
+  return projections === undefined ? {} : { projections }
 }
 
 /**
@@ -1467,13 +1520,31 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
    * Resolve which session one transcript read is served from, without
    * acquiring an Agent owner. This is the read's only asynchronous step
    * besides ensuring the composition; {@link historyCutOf} takes the cut.
+   *
+   * A cold session is asked for the PAGE first, not for its log: a backend
+   * that can read a window answers with just the events this page needs, and
+   * the read then costs the page instead of the conversation. A backend
+   * without that capability — or one whose artifact is small enough that the
+   * full read is the better-understood path — leaves the inspected source
+   * unchanged.
    * @param sessionId - the transcript being read.
-   * @returns the attached session, or the inspected detached header and events.
+   * @param page - the requested page: its exclusive upper bound and quota.
+   * @returns the attached session, a backend window, or the inspected detached header and events.
    * @throws {@link ApiRemoteSessionNotFound} when no project-backed session has that identity.
    */
-  async function historySourceFor(sessionId: SessionId): Promise<HistorySource> {
+  async function historySourceFor(
+    sessionId: SessionId,
+    page: { beforeSeq?: number; maxMessages: number },
+  ): Promise<HistorySource> {
     const attached = ctx.sessions.get(sessionId)
     if (attached !== undefined) return { kind: 'attached', session: attached }
+    const window = await inspectApiRemoteSessionWindow(ctx, sessionId, {
+      maxMessages: page.maxMessages,
+      ...page.beforeSeq === undefined ? {} : { beforeSeq: page.beforeSeq },
+    })
+    if (window !== undefined) {
+      return { kind: 'window', header: window.meta, events: [...window.events], hasMore: window.hasMore }
+    }
     const inspected = await inspectServable(sessionId)
     return { kind: 'detached', header: inspected.meta, events: inspected.events }
   }
@@ -1481,11 +1552,13 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
   /**
    * The header and events {@link presenterScopeFor} reads to decide which
    * composition a transcript ran under.
-   * @param source - the live or detached session this read is served from.
+   * @param source - the live, windowed, or detached session this read is served from.
    * @returns that session's creation header and its events.
    */
   function sourceSession(source: HistorySource): PresetBearingSession {
-    if (source.kind === 'detached') return { header: source.header, events: source.events }
+    if (source.kind === 'detached' || source.kind === 'window') {
+      return { header: source.header, events: source.events }
+    }
     return { header: source.session.header, events: source.session.events }
   }
 
@@ -1502,7 +1575,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
    * @returns the events and, when asked, the baseline for that same position.
    */
   function historyCutOf(
-    source: HistorySource,
+    source: Exclude<HistorySource, { kind: 'window' }>,
     includeProjections: boolean,
   ): { events: SessionEvent[]; projections?: SessionProjectionsBlock } {
     if (source.kind === 'detached') {
@@ -2154,7 +2227,10 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       async history(request) {
         const { sessionId, beforeSeq, maxMessages } = request.payload
         try {
-          const source = await historySourceFor(sessionId)
+          const source = await historySourceFor(sessionId, {
+            maxMessages: maxMessages ?? DEFAULT_MAX_MESSAGES,
+            ...beforeSeq === undefined ? {} : { beforeSeq },
+          })
           // Both awaits happen BEFORE the cut. Ensuring the recorded
           // composition's standing mount is what registers its projection
           // units, so a first cold read would otherwise serve a baseline
@@ -2162,12 +2238,24 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           // appending, so awaiting between the two reads would pair events cut
           // at N with a baseline folded to N+1.
           const scope = await presenterScopeFor(sessionId, sourceSession(source))
+          // A windowed source IS the page: the backend cut it at the same
+          // message boundary `paginate` would, so re-cutting would drop events
+          // the caller asked for and misreport whether older ones exist.
+          if (source.kind === 'window') {
+            return ok(request, {
+              events: pageEntries(ctx, source.events, scope),
+              hasMore: source.hasMore,
+              ...projectionsBlock(
+                beforeSeq === undefined ? windowProjectionsFor(ctx, source.header, source.events) : undefined,
+              ),
+            })
+          }
           const cut = historyCutOf(source, beforeSeq === undefined)
           const page = historyPage(ctx, cut.events, beforeSeq, maxMessages, scope)
           return ok(request, {
             events: page.events,
             hasMore: page.hasMore,
-            ...cut.projections === undefined ? {} : { projections: cut.projections },
+            ...projectionsBlock(cut.projections),
           })
         } catch (error: unknown) {
           if (error instanceof SessionNotFound) {

@@ -340,6 +340,28 @@ abstract load(id: SessionId): Promise<SessionInspection>
 abstract inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspection>
 
 /**
+ * Read ONE bounded window of a stored log — the transcript page a cold read
+ * actually serves — instead of the whole event graph the default full read
+ * materializes. The window starts at the page cut for `maxMessages`
+ * append-origin messages counted backwards from `beforeSeq` (exclusive) or
+ * from the stored tail, and carries {@link SessionLogWindow.hasMore} so the
+ * caller can page further back on demand.
+ *
+ * The default returns `undefined`: a backend that can only read its whole
+ * artifact leaves the caller on its full-read path, which is why adding this
+ * capability is not a contract change for existing backends. A backend that
+ * overrides it owns the same refusals a full read raises for the same bytes
+ * (unreadable container, unparsable row, seq gap) and MUST NOT return a
+ * window whose events are not contiguous.
+ * @param _id - the persisted session to read a window of.
+ * @param _options - the page: its exclusive upper bound and message quota.
+ * @param signal - optional cancellation for backend read work.
+ * @returns the window, or `undefined` when this backend has no windowed read
+ *   and the caller must fall back to {@link inspect}.
+ */
+readWindow(_id: SessionId, _options: SessionWindowOptions, signal?: AbortSignal): Promise<SessionLogWindow | undefined>
+
+/**
  * Read the stored events from `fromSeq` onward — the read-from-seq
  * primitive for read models that resume from a watermark (e.g. a persisted
  * projection cache folding only the tail past its checkpoint). Unlike

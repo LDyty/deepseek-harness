@@ -30,6 +30,32 @@ export interface SessionInspection {
   readonly events: readonly SessionEvent[]
 }
 
+/** One window request: the transcript page a caller needs, in page terms. */
+export interface SessionWindowOptions {
+  /**
+   * Exclusive upper bound in event seq. Omitted asks for the stored tail — the
+   * page a reader sees when a session opens; a client paging further back
+   * passes the first seq of the window it already holds.
+   */
+  beforeSeq?: number
+  /** Maximum append-origin messages the window must contain. */
+  maxMessages: number
+}
+
+/**
+ * One bounded window of a stored log: the events a page-sized read actually
+ * needs, without the rest of the conversation. A window starts at the page
+ * cut, so a caller serves it as-is instead of cutting it again.
+ */
+export interface SessionLogWindow {
+  /** Validated immutable session metadata. */
+  readonly meta: SessionHeader
+  /** The window's contiguous stored events, oldest first. */
+  readonly events: readonly SessionEvent[]
+  /** Whether at least one older event precedes the window. */
+  readonly hasMore: boolean
+}
+
 /** A backend's own raw artifact text for one session, verbatim. */
 export interface SessionRawArtifact {
   /** The session header parsed from the artifact's own first line. */
@@ -198,6 +224,33 @@ export abstract class SessionPersistence extends Service {
    * @returns the validated header and current logical event log.
    */
   abstract inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspection>
+
+  /**
+   * Read ONE bounded window of a stored log — the transcript page a cold read
+   * actually serves — instead of the whole event graph the default full read
+   * materializes. The window starts at the page cut for `maxMessages`
+   * append-origin messages counted backwards from `beforeSeq` (exclusive) or
+   * from the stored tail, and carries {@link SessionLogWindow.hasMore} so the
+   * caller can page further back on demand.
+   *
+   * The default returns `undefined`: a backend that can only read its whole
+   * artifact leaves the caller on its full-read path, which is why adding this
+   * capability is not a contract change for existing backends. A backend that
+   * overrides it owns the same refusals a full read raises for the same bytes
+   * (unreadable container, unparsable row, seq gap) and MUST NOT return a
+   * window whose events are not contiguous.
+   * @param _id - the persisted session to read a window of.
+   * @param _options - the page: its exclusive upper bound and message quota.
+   * @param signal - optional cancellation for backend read work.
+   * @returns the window, or `undefined` when this backend has no windowed read
+   *   and the caller must fall back to {@link inspect}.
+   */
+  readWindow(_id: SessionId, _options: SessionWindowOptions, signal?: AbortSignal): Promise<SessionLogWindow | undefined> {
+    if (signal?.aborted === true) {
+      return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('aborted'))
+    }
+    return Promise.resolve(undefined)
+  }
 
   /**
    * Read the stored events from `fromSeq` onward — the read-from-seq

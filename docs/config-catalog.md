@@ -1737,13 +1737,20 @@ export interface Config {
   preparedSessionCacheSize?: number
   /** Fixed live-event coalescing window; not a backend completion deadline. */
   writeBatchMaxDelayMs?: number
+  /**
+   * Smallest artifact size, in bytes, that a cold transcript page reads as a
+   * window instead of a full log. Below it the full read stays in use, so
+   * ordinary sessions keep exactly the behavior and caching they had before
+   * the windowed read existed; set `0` to window every read of any size.
+   */
+  windowReadMinBytes?: number
 }
 
 /** Physical encoding selected for JSONL session artifacts. */
 export type JsonlCompression = 'zstd' | 'none'
 ```
 
-Source: [`packages/session/session-persistence-jsonl/src/index.ts:60`](../packages/session/session-persistence-jsonl/src/index.ts)
+Source: [`packages/session/session-persistence-jsonl/src/index.ts:76`](../packages/session/session-persistence-jsonl/src/index.ts)
 
 <a id="deepseek-aidsh-session-persistence-sqlite"></a>
 
